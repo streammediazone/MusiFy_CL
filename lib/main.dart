@@ -9,7 +9,10 @@ import 'package:path_provider/path_provider.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:audio_service/audio_service.dart';
+import 'models/track.dart';
 import 'services/flac_picture_parser.dart';
+import 'services/track_naming.dart';
+import 'services/track_ordering.dart';
 
 const _bg = Color(0xFF090D0B);
 const _surface = Color(0xFF151B17);
@@ -47,22 +50,11 @@ class MusiFyApp extends StatelessWidget {
 
 
 
-class Track {
-  const Track({required this.id, required this.name, required this.size, required this.mimeType, this.revision = ''});
-  final String id, name, mimeType, revision;
-  final int size;
-  factory Track.fromJson(Map<String, dynamic> json) => Track(
-    id: (json['id'] ?? json['file_id'] ?? '').toString(),
-    name: (json['name'] ?? json['filename'] ?? 'Neznáma skladba').toString(),
-    size: (json['size'] as num?)?.toInt() ?? 0,
-    mimeType: (json['mime_type'] ?? '').toString(),
-    revision: (json['etag'] ?? json['updated_at'] ?? json['modified_at'] ?? json['last_modified'] ?? '').toString(),
-  );
-}
-
 class KDriveService {
-  static const _driveId = '1800737';
-  static const _shareToken = 'd5b56959-2447-46ed-aa12-942b2ce66042';
+  // Predvolené hodnoty zdieľaného odkazu kDrive. Voliteľne ich možno prepísať pri buildi:
+  // --dart-define=KDRIVE_DRIVE_ID=... --dart-define=KDRIVE_SHARE_TOKEN=...
+  static const _driveId = String.fromEnvironment('KDRIVE_DRIVE_ID', defaultValue: '1800737');
+  static const _shareToken = String.fromEnvironment('KDRIVE_SHARE_TOKEN', defaultValue: 'd5b56959-2447-46ed-aa12-942b2ce66042');
   final http.Client _client = http.Client();
   Uri _downloadUri(String fileId) => Uri.https('kdrive.infomaniak.com', '/2/app/$_driveId/share/$_shareToken/files/$fileId/download');
   Uri _shareRootUri() => Uri.https('kdrive.infomaniak.com', '/2/app/$_driveId/share/$_shareToken/files');
@@ -78,8 +70,14 @@ class KDriveService {
   Future<LibraryResult> loadAudioTracks({
     Future<void> Function(List<Track>)? onInitialBatchReady,
     Future<void> Function(List<Track>)? onProgress,
+    bool Function()? isCancelled,
   }) async {
+    if (_driveId.isEmpty || _shareToken.isEmpty) {
+      throw StateError('Chýba konfigurácia kDrive. Skontroluj hodnoty _driveId a _shareToken v KDriveService.');
+    }
+    bool cancelled() => isCancelled?.call() ?? false;
     final root = await _getJson(_shareRootUri());
+    if (cancelled()) return const LibraryResult(<Track>[], <String>[]);
     if (root is! Map || root['data'] is! Map) throw FormatException('kDrive neposkytol metadáta zdieľaného priečinka.');
     final rootData = Map<String, dynamic>.from(root['data'] as Map);
     final rootId = (rootData['id'] ?? '').toString();
@@ -112,6 +110,7 @@ class KDriveService {
       String? cursor;
       var pageNumber = 1;
       for (var page = 0; page < 100; page++) {
+        if (cancelled()) break;
         final requestMode = cursor == null ? 'page=$pageNumber' : 'cursor (${cursor.length} znakov)';
         final response = await _getJson(_folderFilesUri(folderId, cursor: cursor, page: cursor == null ? pageNumber : null));
         final pageData = _parsePage(response);
@@ -180,7 +179,7 @@ class KDriveService {
       if (excludedSamples.isNotEmpty) logs.add('Vynechané súbory (ukážka): ${excludedSamples.join(' | ')}');
       return (tracks: folderTracks, folders: childFolders, logs: logs);
     }
-    while (pendingFolders.isNotEmpty) {
+    while (pendingFolders.isNotEmpty && !cancelled()) {
       final batch = pendingFolders.take(3).toList();
       pendingFolders = pendingFolders.skip(batch.length).toList();
       final fresh = batch.where((id) => visitedFolders.add(id)).toList();
@@ -191,6 +190,7 @@ class KDriveService {
         diagnostics.addAll(result.logs);
       }
     }
+    if (cancelled()) return LibraryResult(const <Track>[], diagnostics);
     if (!initialBatchPublished && allUniqueTracks.isNotEmpty) {
       initialBatchPublished = true;
       final initialTracks = allUniqueTracks.values.take(100).toList()
@@ -352,26 +352,39 @@ class _LibraryPageState extends State<LibraryPage> {
   int _activeArtworkWorkers = 0;
   Directory? _artworkCacheDirectory;
   final http.Client _artworkClient = http.Client();
-  String _sort = 'Názov';
+  String _sort = sortNameAsc;
+  bool _flacOnly = false;
+  int _loadGeneration = 0;
+  String? _currentTrackId;
+  final ValueNotifier<String?> _currentTrackIdListenable = ValueNotifier<String?>(null);
+  bool _queueRebuilding = false;
+  // Kontext (zoradenie a filter), s ktorým bola postavená aktuálna prehrávacia fronta.
+  String _queueSort = sortNameAsc;
+  bool _queueFlacOnly = false;
+  String _queueQuery = '';
 
   @override void initState() {
     super.initState();
     _future = _loadLibrary();
     _player = AudioPlayer();
-    _player.currentIndexStream.listen((index) { if (mounted && index != null) { setState(() => _currentIndex = index); final tracks = _loadedTracks ?? _cachedTracks; if (tracks != null && index >= 0 && index < tracks.length) _loadArtwork(tracks[index]); } });
+    _player.currentIndexStream.listen((index) { if (index != null) _syncCurrentTrack(); });
   }
-  @override void dispose() { _searchFocus.dispose(); _search.dispose(); _tracksListenable.dispose(); for (final notifier in _trackArtwork.values) { notifier.dispose(); } _artworkClient.close(); _service._client.close(); _player.dispose(); super.dispose(); }
+  @override void dispose() { _searchFocus.dispose(); _search.dispose(); _tracksListenable.dispose(); _currentTrackIdListenable.dispose(); for (final notifier in _trackArtwork.values) { notifier.dispose(); } _artworkClient.close(); _service._client.close(); _player.dispose(); super.dispose(); }
   void _dismissSearchKeyboard() {
     _searchFocus.unfocus();
     FocusManager.instance.primaryFocus?.unfocus();
     SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
   }
   Future<void> _reload() async {
+    _loadGeneration++; // zneplatní prebiehajúce načítanie a jeho callbacky
     await _player.stop();
     if (!mounted) return;
     _playlistReady = false;
     _playlistTrackIds = <String>[];
     _currentIndex = null;
+    _currentTrackId = null;
+    _currentTrackIdListenable.value = null;
+    _queueRebuilding = false;
     _cachedTracks = null;
     _loadedTracks = null;
     _tracksListenable.value = <Track>[];
@@ -380,90 +393,134 @@ class _LibraryPageState extends State<LibraryPage> {
     _artworkChecked.clear();
     _artworkQueue.clear();
     _initialArtworkCompleted = 0;
+    _initialArtworkTotal = 100;
+    _initialArtworkFailures = 0;
     _initialArtworkStage = 'Sťahujem a kontrolujem obaly';
     if (!mounted) return;
     setState(() => _future = _loadLibrary());
   }
 
 
-  Future<LibraryResult> _loadLibrary() => _service.loadAudioTracks(
-    onInitialBatchReady: _handleInitialBatchReady,
-    onProgress: _handleLibraryProgress,
-  );
+  Future<LibraryResult> _loadLibrary() {
+    final generation = _loadGeneration;
+    return _service.loadAudioTracks(
+      isCancelled: () => _isStale(generation),
+      onInitialBatchReady: (tracks) => _handleInitialBatchReady(tracks, generation),
+      onProgress: (tracks) => _handleLibraryProgress(tracks, generation),
+    );
+  }
 
-  Future<void> _handleInitialBatchReady(List<Track> tracks) async {
-    if (!mounted) return;
+  bool _isStale(int generation) => !mounted || generation != _loadGeneration;
+
+  Future<void> _handleInitialBatchReady(List<Track> tracks, int generation) async {
+    if (_isStale(generation)) return;
     _initialArtworkTotal = tracks.length;
     _initialArtworkCompleted = 0;
     _initialArtworkFailures = 0;
     _initialArtworkStage = 'Sťahujem a kontrolujem obaly';
-    if (mounted) setState(() {});
+    setState(() {});
     await _prefetchArtwork(tracks, onProgress: (done, total) {
+      if (_isStale(generation)) return;
       _initialArtworkCompleted = done;
       _initialArtworkTotal = total;
-      if (mounted) setState(() {});
+      setState(() {});
     });
-    if (!mounted) return;
+    if (_isStale(generation)) return;
     _initialArtworkStage = 'Pripravujem obrázky na zobrazenie';
     _initialArtworkCompleted = 0;
     setState(() {});
     await _precacheInitialArtwork(tracks, onProgress: (done, total) {
+      if (_isStale(generation)) return;
       _initialArtworkCompleted = done;
       _initialArtworkTotal = total;
-      if (mounted) setState(() {});
+      setState(() {});
     });
-    if (!mounted) return;
+    if (_isStale(generation)) return;
     _loadedTracks = tracks;
     _tracksListenable.value = tracks;
     setState(() {});
   }
 
-  Future<void> _handleLibraryProgress(List<Track> tracks) async {
-    if (!mounted) return;
+  Future<void> _handleLibraryProgress(List<Track> tracks, int generation) async {
+    if (_isStale(generation)) return;
     _loadedTracks = tracks;
-    if (mounted) {
-      _tracksListenable.value = tracks;
-      setState(() {});
-    }
-    await _appendTracksToPlaylist(tracks);
+    _tracksListenable.value = tracks;
+    setState(() {});
+    await _appendTracksToPlaylist(tracks, generation: generation);
   }
 
-  Future<void> _appendTracksToPlaylist(List<Track> tracks) async {
-    if (tracks.isEmpty) return;
-    final previousMutation = _playlistMutation;
+  /// Zaradí zmeny fronty za seba, aby sa nikdy neprekrývali.
+  Future<T> _serializePlaylist<T>(Future<T> Function() action) async {
+    final previous = _playlistMutation;
     final gate = Completer<void>();
     _playlistMutation = gate.future;
-    await previousMutation;
+    await previous;
     try {
+      return await action();
+    } finally {
+      gate.complete();
+    }
+  }
+
+  /// Doplní do fronty novo objavené skladby tak, aby fronta mala rovnaké
+  /// poradie a filter, s akým sa začalo prehrávanie.
+  Future<void> _appendTracksToPlaylist(List<Track> tracks, {int? generation}) {
+    if (tracks.isEmpty) return Future<void>.value();
+    return _serializePlaylist<void>(() async {
+      if (generation != null && _isStale(generation)) return;
       final source = _playlistSource;
       if (!_playlistReady || source == null) return;
-      // The library is alphabetically ordered. Insert newly discovered tracks
-      // at their final position so the playback queue keeps the same order.
-      for (var index = 0; index < tracks.length; index++) {
-        final track = tracks[index];
+      final desired = orderTracks(tracks, sort: _queueSort, flacOnly: _queueFlacOnly, query: _queueQuery);
+      for (var index = 0; index < desired.length; index++) {
+        final track = desired[index];
         if (index < _playlistTrackIds.length && _playlistTrackIds[index] == track.id) {
           continue;
         }
         if (_playlistTrackIds.contains(track.id)) {
           continue;
         }
-        _playlistTrackIds.insert(index, track.id);
+        final insertAt = index > _playlistTrackIds.length ? _playlistTrackIds.length : index;
         try {
-          await source.insert(index, _audioSourceFor(track));
+          await source.insert(insertAt, _audioSourceFor(track));
         } catch (_) {
-          _playlistTrackIds.removeAt(index);
-          // A library update must never interrupt current playback.
+          // Aktualizácia knižnice nesmie prerušiť aktuálne prehrávanie.
           break;
         }
+        _playlistTrackIds.insert(insertAt, track.id);
+        _syncCurrentTrack();
       }
-    } finally {
-      gate.complete();
+    });
+  }
+
+  Track? _trackForId(String? id) {
+    if (id == null) return null;
+    final tracks = _loadedTracks ?? _cachedTracks;
+    if (tracks == null) return null;
+    for (final track in tracks) {
+      if (track.id == id) return track;
     }
+    return null;
+  }
+
+  /// Zosúladí aktuálnu skladbu (podľa ID) s indexom, na ktorom je prehrávač.
+  void _syncCurrentTrack() {
+    if (!mounted || _queueRebuilding) return;
+    final index = _player.currentIndex;
+    if (index == null) return;
+    final id = index >= 0 && index < _playlistTrackIds.length ? _playlistTrackIds[index] : null;
+    if (index == _currentIndex && id == _currentTrackId) return;
+    setState(() {
+      _currentIndex = index;
+      _currentTrackId = id;
+    });
+    _currentTrackIdListenable.value = id;
+    final track = _trackForId(id);
+    if (track != null) _loadArtwork(track);
   }
 
   AudioSource _audioSourceFor(Track track) => AudioSource.uri(
     _service._downloadUri(track.id),
-    tag: MediaItem(id: track.id, title: track.name, album: 'MusiFy'),
+    tag: MediaItem(id: track.id, title: titleOf(track.name), artist: parseArtist(track.name), album: 'MusiFy'),
   );
 
   Future<void> _prefetchArtwork(
@@ -731,29 +788,49 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _playTrack(String trackId) async {
     final tracks = _loadedTracks ?? (await _future).tracks;
-    final index = tracks.indexWhere((track) => track.id == trackId);
+    // Fronta sa stavia v rovnakom poradí a s rovnakým filtrom ako zobrazený zoznam.
+    final queue = orderTracks(tracks, sort: _sort, flacOnly: _flacOnly, query: _search.text);
+    final index = queue.indexWhere((track) => track.id == trackId);
     if (index < 0) return;
-    setState(() { _currentIndex = index; _loadingTrack = true; });
-    _loadArtwork(tracks[index]);
+    setState(() { _currentIndex = index; _currentTrackId = trackId; _loadingTrack = true; });
+    _currentTrackIdListenable.value = trackId;
+    _loadArtwork(queue[index]);
     try {
-      final latestIds = tracks.map((track) => track.id).toList(growable: false);
-      if (!_playlistReady || _playlistSource == null) {
-        final source = ConcatenatingAudioSource(
-          children: tracks.map(_audioSourceFor).toList(growable: false),
-        );
-        await _player.setAudioSource(source, initialIndex: index, initialPosition: Duration.zero);
-        _playlistSource = source;
-        _playlistTrackIds = latestIds;
-        _playlistReady = true;
-        await _appendTracksToPlaylist(_loadedTracks ?? tracks);
-      } else if (!listEquals(latestIds, _playlistTrackIds)) {
+      final query = _search.text.trim().toLowerCase();
+      final contextChanged = _queueSort != _sort || _queueFlacOnly != _flacOnly || _queueQuery != query;
+      var rebuild = !_playlistReady || _playlistSource == null || contextChanged;
+      if (!rebuild) {
         await _appendTracksToPlaylist(tracks);
-        final currentPlaylistIndex = _playlistTrackIds.indexOf(tracks[index].id);
-        if (currentPlaylistIndex >= 0) {
-          await _player.seek(Duration.zero, index: currentPlaylistIndex);
-        }
+        rebuild = !_playlistTrackIds.contains(trackId);
+      }
+      if (rebuild) {
+        final queueIds = queue.map((track) => track.id).toList(growable: false);
+        await _serializePlaylist<void>(() async {
+          _queueRebuilding = true;
+          _playlistReady = false;
+          try {
+            final source = ConcatenatingAudioSource(
+              children: queue.map(_audioSourceFor).toList(growable: false),
+            );
+            _playlistSource = source;
+            _playlistTrackIds = List<String>.of(queueIds);
+            _queueSort = _sort;
+            _queueFlacOnly = _flacOnly;
+            _queueQuery = query;
+            await _player.setAudioSource(source, initialIndex: index, initialPosition: Duration.zero);
+            _playlistReady = true;
+          } catch (_) {
+            _playlistSource = null;
+            _playlistTrackIds = <String>[];
+            rethrow;
+          } finally {
+            _queueRebuilding = false;
+          }
+        });
+        _syncCurrentTrack();
+        await _appendTracksToPlaylist(_loadedTracks ?? tracks);
       } else {
-        await _player.seek(Duration.zero, index: index);
+        await _player.seek(Duration.zero, index: _playlistTrackIds.indexOf(trackId));
       }
       final playbackFuture = _player.play();
       if (mounted) setState(() => _loadingTrack = false);
@@ -773,21 +850,10 @@ class _LibraryPageState extends State<LibraryPage> {
     final mb = bytes / 1048576;
     return mb >= 1024 ? '${(mb/1024).toStringAsFixed(1)} GB' : '${mb.toStringAsFixed(1)} MB';
   }
-  String _artist(String name) {
-    final dash = name.indexOf(' - ');
-    return dash > 0 ? name.substring(0,dash) : 'Miestna knižnica';
-  }
-  String _title(String name) {
-    final dash = name.indexOf(' - ');
-    return dash > 0 ? name.substring(dash+3).replaceAll(RegExp(r'\\.(flac|mp3|m4a|aac|ogg|opus|wav|wma)$',caseSensitive:false),'') : name.replaceAll(RegExp(r'\\.(flac|mp3|m4a|aac|ogg|opus|wav|wma)$',caseSensitive:false),'');
-  }
-  List<Track> _visible(List<Track> tracks) {
-    final q = _search.text.trim().toLowerCase();
-    var result = tracks.where((t) => q.isEmpty || t.name.toLowerCase().contains(q)).toList();
-    if (_sort == 'Interpret') result.sort((a,b) => _artist(a.name).compareTo(_artist(b.name)));
-    if (_sort == 'Názov Z–A') result.sort((a,b) => b.name.toLowerCase().compareTo(a.name.toLowerCase()));
-    return result;
-  }
+  String _artist(String name) => artistOf(name);
+  String _title(String name) => titleOf(name);
+  List<Track> _visible(List<Track> tracks) =>
+      orderTracks(tracks, sort: _sort, flacOnly: _flacOnly, query: _search.text);
 
   @override Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
@@ -817,7 +883,6 @@ class _LibraryPageState extends State<LibraryPage> {
         final tracks = snapshot.data?.tracks ?? _loadedTracks ?? const <Track>[];
         _cachedTracks = tracks;
         final visible = _visible(tracks);
-        final trackIndices = <String, int>{for (var i = 0; i < tracks.length; i++) tracks[i].id: i};
         return Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
           Padding(padding:const EdgeInsets.fromLTRB(20,12,20,14),child:Row(crossAxisAlignment:CrossAxisAlignment.end,children:[
             Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[const Text('Tvoja hudba',style:TextStyle(fontSize:25,fontWeight:FontWeight.w800,letterSpacing:-.6)),const SizedBox(height:3),Text(snapshot.hasError ? 'Synchronizácia zvyšku knižnice zlyhala' : snapshot.connectionState == ConnectionState.waiting ? 'Načítavam ďalšie skladby na pozadí…' : (_initialArtworkFailures > 0 ? 'Niektoré obaly sa nepodarilo načítať' : 'Hudobná knižnica'),style:const TextStyle(color:_muted,fontSize:13))])),
@@ -826,14 +891,14 @@ class _LibraryPageState extends State<LibraryPage> {
           Padding(padding:const EdgeInsets.symmetric(horizontal:16),child:Container(height:50,decoration:BoxDecoration(color:_surface,borderRadius:BorderRadius.circular(16),border:Border.all(color:const Color(0xFF27332A))),child:TextField(controller:_search,focusNode:_searchFocus,textInputAction:TextInputAction.search,onSubmitted:(_)=>_dismissSearchKeyboard(),onTapOutside:(_)=>_dismissSearchKeyboard(),onChanged:(_)=>setState((){}),style:const TextStyle(fontSize:14),decoration:InputDecoration(hintText:'Hľadať skladbu alebo interpreta…',hintStyle:const TextStyle(color:_muted,fontSize:14),prefixIcon:const Icon(Icons.search_rounded,color:_muted),suffixIcon:_search.text.isEmpty?null:IconButton(onPressed:(){_search.clear();setState((){});},icon:const Icon(Icons.close_rounded)),border:InputBorder.none,contentPadding:const EdgeInsets.symmetric(vertical:14))))),
           const SizedBox(height:13),
           Padding(padding:const EdgeInsets.symmetric(horizontal:16),child:Row(children:[
-            _filterChip('Všetky',true),
-            const SizedBox(width:8),_filterChip('FLAC',false),
+            _filterChip('Všetky',flacOnly:false),
+            const SizedBox(width:8),_filterChip('FLAC',flacOnly:true),
             const Spacer(),
-            PopupMenuButton<String>(onSelected:(v)=>setState(()=>_sort=v),itemBuilder:(_)=>const [PopupMenuItem(value:'Názov',child:Text('Názov A–Z')),PopupMenuItem(value:'Názov Z–A',child:Text('Názov Z–A')),PopupMenuItem(value:'Interpret',child:Text('Interpret'))],child:Container(padding:const EdgeInsets.symmetric(horizontal:11,vertical:8),decoration:BoxDecoration(color:_surface,borderRadius:BorderRadius.circular(12)),child:Row(children:[const Icon(Icons.sort_rounded,size:17,color:_green),const SizedBox(width:5),Text(_sort,style:const TextStyle(fontSize:12))]))),
+            PopupMenuButton<String>(onSelected:(v)=>setState(()=>_sort=v),itemBuilder:(_)=>const [PopupMenuItem(value:sortNameAsc,child:Text('Názov A–Z')),PopupMenuItem(value:sortNameDesc,child:Text('Názov Z–A')),PopupMenuItem(value:sortArtist,child:Text('Interpret'))],child:Container(padding:const EdgeInsets.symmetric(horizontal:11,vertical:8),decoration:BoxDecoration(color:_surface,borderRadius:BorderRadius.circular(12)),child:Row(children:[const Icon(Icons.sort_rounded,size:17,color:_green),const SizedBox(width:5),Text(_sort,style:const TextStyle(fontSize:12))]))),
           ])),
           const SizedBox(height:8),
           Expanded(child:visible.isEmpty?const Center(child:Text('Žiadne skladby nezodpovedajú vyhľadávaniu.',style:TextStyle(color:_muted))):ListView.builder(cacheExtent:700,padding:const EdgeInsets.fromLTRB(12,4,12,14),itemCount:visible.length,itemBuilder:(context,i){
-            final track=visible[i]; final originalIndex=trackIndices[track.id] ?? -1; final active=_currentIndex==originalIndex;
+            final track=visible[i]; final active=_currentTrackId==track.id;
             _prioritizeArtwork(track);
             final details=[_artist(track.name),if(_size(track.size).isNotEmpty)_size(track.size)].join('  •  ');
             return Padding(
@@ -843,7 +908,7 @@ class _LibraryPageState extends State<LibraryPage> {
                 borderRadius: BorderRadius.circular(15),
                 child: InkWell(
                   borderRadius: BorderRadius.circular(15),
-                  onTap: originalIndex < 0 ? null : () => _playTrack(track.id),
+                  onTap: () => _playTrack(track.id),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 9),
                     child: Row(children: [
@@ -856,7 +921,7 @@ class _LibraryPageState extends State<LibraryPage> {
                         Text(details, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: _muted, fontSize: 11)),
                       ])),
                       const SizedBox(width: 6),
-                      Icon(active ? Icons.graphic_eq_rounded : Icons.more_horiz_rounded, color: active ? _green : _muted, size: 22),
+                      active ? const Icon(Icons.graphic_eq_rounded, color: _green, size: 22) : const SizedBox(width: 22),
                     ]),
                   ),
                 ),
@@ -869,9 +934,9 @@ class _LibraryPageState extends State<LibraryPage> {
     bottomNavigationBar:_currentIndex==null?null:_miniPlayer(),
   );
 
-  Widget _filterChip(String label,bool all) {
-    final selected=all;
-    return ChoiceChip(label:Text(label),selected:selected,onSelected:(_){if(!all) { return; }},showCheckmark:false,labelStyle:TextStyle(fontSize:12,fontWeight:FontWeight.w700,color:selected?_bg:_muted),selectedColor:_green,backgroundColor:_surface,side:BorderSide(color:selected?_green:const Color(0xFF29342C)),padding:const EdgeInsets.symmetric(horizontal:8));
+  Widget _filterChip(String label,{required bool flacOnly}) {
+    final selected=_flacOnly==flacOnly;
+    return ChoiceChip(label:Text(label),selected:selected,onSelected:(_)=>setState(()=>_flacOnly=flacOnly),showCheckmark:false,labelStyle:TextStyle(fontSize:12,fontWeight:FontWeight.w700,color:selected?_bg:_muted),selectedColor:_green,backgroundColor:_surface,side:BorderSide(color:selected?_green:const Color(0xFF29342C)),padding:const EdgeInsets.symmetric(horizontal:8));
   }
   Widget _miniPlayer()=>SafeArea(top:false,child:GestureDetector(onTap:_openPlayer,child:Container(
     margin:const EdgeInsets.fromLTRB(10,0,10,7),
@@ -879,10 +944,10 @@ class _LibraryPageState extends State<LibraryPage> {
     decoration:BoxDecoration(color:_surface2,borderRadius:BorderRadius.circular(18),border:Border.all(color:const Color(0xFF344238))),
     child:Column(mainAxisSize:MainAxisSize.min,children:[
       Row(crossAxisAlignment:CrossAxisAlignment.center,children:[
-        _currentIndex!=null&&_cachedTracks!=null&&_currentIndex!<_cachedTracks!.length?_artworkOrFallback(_cachedTracks![_currentIndex!].id,_currentIndex!,size:59,iconSize:30):const SizedBox(width:59,height:59),const SizedBox(width:12),
+        _currentTrackId!=null?_artworkOrFallback(_currentTrackId!,_currentIndex??0,size:59,iconSize:30):const SizedBox(width:59,height:59),const SizedBox(width:12),
         Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-          Text(_currentIndex==null?'':_title(_trackTitle(_currentIndex!)),maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontWeight:FontWeight.w700,fontSize:14)),
-          const SizedBox(height:3),Text(_currentIndex==null?'':'MusiFy  •  FLAC',style:const TextStyle(color:_muted,fontSize:12)),
+          Text(_title(_trackTitle()),maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontWeight:FontWeight.w700,fontSize:14)),
+          const SizedBox(height:3),Text(_miniSubtitle(),style:const TextStyle(color:_muted,fontSize:12)),
         ])),
         IconButton(tooltip:'Predchádzajúca skladba',constraints:const BoxConstraints(minWidth:56,minHeight:60),onPressed:_currentIndex==null||_currentIndex!<=0?null:()=>_player.seekToPrevious(),icon:const Icon(Icons.skip_previous_rounded,size:34)),
         StreamBuilder<PlayerState>(stream:_player.playerStateStream,builder:(context,snapshot){
@@ -899,11 +964,18 @@ class _LibraryPageState extends State<LibraryPage> {
     ]),
   )));
 
-  String _trackTitle(int index)=>_cachedTracks!=null&&index>=0&&index<_cachedTracks!.length?_cachedTracks![index].name:'MusiFy';
+  String _trackTitle()=>_trackForId(_currentTrackId)?.name??'MusiFy';
+
+  String _miniSubtitle() {
+    final track=_trackForId(_currentTrackId);
+    if (track==null) return 'MusiFy';
+    final format=formatLabelOf(track.name);
+    return format.isEmpty?_artist(track.name):'${_artist(track.name)}  •  $format';
+  }
 
   void _openPlayer() {
     _dismissSearchKeyboard();
-    showModalBottomSheet(context:context,isScrollControlled:true,backgroundColor:Colors.transparent,builder:(context)=>_FullPlayer(player:_player,tracksListenable:_tracksListenable,artworkForTrack:_artworkNotifier));
+    showModalBottomSheet(context:context,isScrollControlled:true,backgroundColor:Colors.transparent,builder:(context)=>_FullPlayer(player:_player,tracksListenable:_tracksListenable,currentTrackId:_currentTrackIdListenable,trackFor:_trackForId,artworkForTrack:_artworkNotifier));
   }
   void _showSettings()=>showModalBottomSheet(context:context,backgroundColor:_surface,isScrollControlled:true,showDragHandle:true,builder:(context)=>SafeArea(child:Padding(padding:const EdgeInsets.fromLTRB(20,8,20,28),child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[
     const Text('Nastavenia',style:TextStyle(fontSize:23,fontWeight:FontWeight.w800)),const SizedBox(height:16),
@@ -929,7 +1001,7 @@ class _LibraryPageState extends State<LibraryPage> {
               ];
               return Padding(
                 padding: const EdgeInsets.all(12),
-                child: SelectableText(lines.join('\\n'), style: const TextStyle(color: _muted, fontSize: 11)),
+                child: SelectableText(lines.join('\n'), style: const TextStyle(color: _muted, fontSize: 11)),
               );
             },
           ),
@@ -962,7 +1034,7 @@ class _LibraryPageState extends State<LibraryPage> {
                 child: Text('Diagnostické údaje nie sú dostupné.', style: TextStyle(color: _muted)),
               );
             }
-            final report = result.diagnostics.join('\\n');
+            final report = result.diagnostics.join('\n');
             return Padding(
               padding: const EdgeInsets.all(12),
               child: Column(
@@ -995,20 +1067,14 @@ class _LibraryPageState extends State<LibraryPage> {
 }
 
 class _FullPlayer extends StatelessWidget {
-  const _FullPlayer({required this.player,required this.tracksListenable,required this.artworkForTrack});
+  const _FullPlayer({required this.player,required this.tracksListenable,required this.currentTrackId,required this.trackFor,required this.artworkForTrack});
   final AudioPlayer player;
   final ValueListenable<List<Track>> tracksListenable;
+  final ValueListenable<String?> currentTrackId;
+  final Track? Function(String?) trackFor;
   final ValueListenable<File?> Function(String) artworkForTrack;
-  String _time(Duration d)=>'${d.inMinutes}:${(d.inSeconds%60).toString().padLeft(2,'0')}';
-  String _artist(String name) {
-    final dash=name.indexOf(' - ');
-    return dash>0?name.substring(0,dash):'Miestna knižnica';
-  }
-  String _title(String name) {
-    final dash=name.indexOf(' - ');
-    final value=dash>0?name.substring(dash+3):name;
-    return value.replaceAll(RegExp(r'\\.(flac|mp3|m4a|aac|ogg|opus|wav|wma)$',caseSensitive:false),'');
-  }
+  String _artist(String name)=>artistOf(name);
+  String _title(String name)=>titleOf(name);
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -1019,18 +1085,17 @@ class _FullPlayer extends StatelessWidget {
           padding:const EdgeInsets.fromLTRB(22,8,22,20),
           child:ValueListenableBuilder<List<Track>>(
             valueListenable: tracksListenable,
-            builder: (context, tracks, _) => StreamBuilder<int?>(
-            stream:player.currentIndexStream,
-            initialData:player.currentIndex,
-            builder:(context,indexSnapshot) {
-              final index=indexSnapshot.data;
-              final valid=index!=null&&index>=0&&index<tracks.length;
-              final name=valid?tracks[index].name:'MusiFy';
+            builder: (context, tracks, _) => ValueListenableBuilder<String?>(
+            valueListenable: currentTrackId,
+            builder:(context,trackId,_) {
+              final track=trackFor(trackId);
+              final valid=track!=null;
+              final name=track?.name??'MusiFy';
               return Column(children:[
                 Row(children:[
                   IconButton(onPressed:()=>Navigator.pop(context),icon:const Icon(Icons.keyboard_arrow_down_rounded,size:30)),
                   const Expanded(child:Text('PRÁVE SA PREHRÁVA',textAlign:TextAlign.center,style:TextStyle(color:_muted,fontSize:11,fontWeight:FontWeight.w700,letterSpacing:1.5))),
-                  IconButton(onPressed:()=>Navigator.pop(context),icon:const Icon(Icons.more_horiz_rounded)),
+                  const SizedBox(width:48),
                 ]),
                 const Spacer(),
                 Container(
@@ -1038,9 +1103,9 @@ class _FullPlayer extends StatelessWidget {
                   height:MediaQuery.of(context).size.width*.72,
                   constraints:const BoxConstraints(maxWidth:320,maxHeight:320),
                   decoration:BoxDecoration(borderRadius:BorderRadius.circular(28),gradient:const LinearGradient(begin:Alignment.topLeft,end:Alignment.bottomRight,colors:[Color(0xFF244A31),Color(0xFF13251B),Color(0xFF263A2C)]),boxShadow:[BoxShadow(color:_green.withValues(alpha: .12),blurRadius:40,spreadRadius:2)]),
-                  child: valid
+                  child: track != null
                     ? ValueListenableBuilder<File?>(
-                        valueListenable: artworkForTrack(tracks[index].id),
+                        valueListenable: artworkForTrack(track.id),
                         builder: (context, imageFile, _) => imageFile == null
                           ? const Center(child:Icon(Icons.graphic_eq_rounded,size:112,color:_green))
                           : ClipRRect(
@@ -1051,22 +1116,11 @@ class _FullPlayer extends StatelessWidget {
                     : const Center(child:Icon(Icons.graphic_eq_rounded,size:112,color:_green)),
                 ),
                 const SizedBox(height:34),
-                Text(_title(name),key:ValueKey('title-$index'),maxLines:2,textAlign:TextAlign.center,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:22,fontWeight:FontWeight.w800,letterSpacing:-.4)),
+                Text(_title(name),key:ValueKey('title-$trackId'),maxLines:2,textAlign:TextAlign.center,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:22,fontWeight:FontWeight.w800,letterSpacing:-.4)),
                 const SizedBox(height:7),
-                Text(valid?_artist(name):'',key:ValueKey('artist-$index'),style:const TextStyle(color:_muted,fontSize:14)),
+                Text(valid?_artist(name):'',key:ValueKey('artist-$trackId'),style:const TextStyle(color:_muted,fontSize:14)),
                 const SizedBox(height:25),
-                StreamBuilder<Duration>(stream:player.positionStream,builder:(context,s){
-                  final duration=player.duration??Duration.zero;
-                  final pos=s.data??Duration.zero;
-                  final max=duration.inMilliseconds.toDouble().clamp(1,double.infinity).toDouble();
-                  return Column(children:[
-                    Slider(value:pos.inMilliseconds.toDouble().clamp(0,max).toDouble(),max:max,onChanged:(v)=>player.seek(Duration(milliseconds:v.round()))),
-                    Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
-                      Text(_time(pos),style:const TextStyle(color:_muted,fontSize:12)),
-                      Text(_time(duration),style:const TextStyle(color:_muted,fontSize:12)),
-                    ]),
-                  ]);
-                }),
+                _SeekBar(player:player),
                 const SizedBox(height:18),
                 Row(mainAxisAlignment:MainAxisAlignment.spaceEvenly,children:[
                   IconButton(iconSize:25,onPressed:()=>player.setShuffleModeEnabled(!player.shuffleModeEnabled),icon:StreamBuilder<bool>(stream:player.shuffleModeEnabledStream,builder:(c,s)=>Icon(Icons.shuffle_rounded,color:(s.data??false)?_green:_muted))),
@@ -1085,6 +1139,61 @@ class _FullPlayer extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Posuvník prehrávania. Počas ťahania prsta sa len zobrazuje pozícia a skutočné
+/// `seek` sa vykoná až po pustení, aby sa streamovaný súbor zbytočne nepretáčal.
+class _SeekBar extends StatefulWidget {
+  const _SeekBar({required this.player});
+  final AudioPlayer player;
+  @override
+  State<_SeekBar> createState() => _SeekBarState();
+}
+
+class _SeekBarState extends State<_SeekBar> {
+  double? _dragValue;
+
+  String _time(Duration d) {
+    final hours = d.inHours;
+    final minutes = d.inMinutes % 60;
+    final seconds = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return hours > 0 ? '$hours:${minutes.toString().padLeft(2, '0')}:$seconds' : '$minutes:$seconds';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final player = widget.player;
+    return StreamBuilder<Duration?>(
+      stream: player.durationStream,
+      initialData: player.duration,
+      builder: (context, durationSnapshot) {
+        final duration = durationSnapshot.data ?? Duration.zero;
+        return StreamBuilder<Duration>(
+          stream: player.positionStream,
+          builder: (context, positionSnapshot) {
+            final position = positionSnapshot.data ?? Duration.zero;
+            final max = duration.inMilliseconds > 0 ? duration.inMilliseconds.toDouble() : 1.0;
+            final value = (_dragValue ?? position.inMilliseconds.toDouble()).clamp(0.0, max).toDouble();
+            return Column(children: [
+              Slider(
+                value: value,
+                max: max,
+                onChanged: (v) => setState(() => _dragValue = v),
+                onChangeEnd: (v) async {
+                  await player.seek(Duration(milliseconds: v.round()));
+                  if (mounted) setState(() => _dragValue = null);
+                },
+              ),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                Text(_time(Duration(milliseconds: value.round())), style: const TextStyle(color: _muted, fontSize: 12)),
+                Text(_time(duration), style: const TextStyle(color: _muted, fontSize: 12)),
+              ]),
+            ]);
+          },
+        );
+      },
     );
   }
 }
